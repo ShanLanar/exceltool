@@ -11,14 +11,15 @@ Der GUI-Aufbau liegt in main() und wird beim bloßen Import NICHT ausgeführt.
 
 import os
 import sys
+import time
 import types
 import tempfile
 import zipfile
 
 # --- tkinter ggf. stubben, damit das Modul auch headless importierbar ist ---
-try:  # pragma: no cover - hängt von der Umgebung ab
-    import tkinter  # noqa: F401
-except Exception:
+import importlib.util
+
+if importlib.util.find_spec("tkinter") is None:  # pragma: no cover - umgebungsabhängig
     _stub = types.ModuleType("tkinter")
     for _sub in ("filedialog", "messagebox", "ttk"):
         _m = types.ModuleType(f"tkinter.{_sub}")
@@ -232,6 +233,72 @@ def test_entferne_schutz_integration():
         check(not wb2.active.protection.sheet, "Blattschutz deaktiviert")
 
 
+def test_convert_files_to_workbook():
+    print("test_convert_files_to_workbook")
+    from openpyxl import Workbook, load_workbook
+    with tempfile.TemporaryDirectory() as d:
+        csv1 = os.path.join(d, "komma.csv")
+        with open(csv1, "w", encoding="utf-8", newline="") as f:
+            f.write("a,b\n1,2\n3,4\n")
+        csv2 = os.path.join(d, "semikolon.csv")
+        with open(csv2, "w", encoding="utf-8", newline="") as f:
+            f.write("x;y\n5;6\n")
+        xlsx_in = os.path.join(d, "mappe.xlsx")
+        wb = Workbook()
+        wb.active["A1"] = "z"
+        wb.save(xlsx_in)
+
+        out = os.path.join(d, "out.xlsx")
+        errors = []
+        progress = []
+        written = et.convert_files_to_workbook(
+            [csv1, csv2, xlsx_in], out,
+            progress=progress.append,
+            on_file_error=lambda f, e: errors.append((f, e)),
+        )
+        check(written == 3, f"3 Blätter geschrieben -> {written}")
+        check(errors == [], f"keine Datei-Fehler -> {errors}")
+        check(progress == [1, 2, 3], f"Fortschritt 1..3 gemeldet -> {progress}")
+        names = load_workbook(out).sheetnames
+        check(len(names) == 3, f"3 Reiter in Zieldatei -> {names}")
+
+
+def test_convert_empty_creates_placeholder():
+    print("test_convert_empty_creates_placeholder")
+    from openpyxl import load_workbook
+    with tempfile.TemporaryDirectory() as d:
+        bad = os.path.join(d, "egal.txt")
+        with open(bad, "w", encoding="utf-8") as f:
+            f.write("kein tabellenformat")
+        out = os.path.join(d, "leer.xlsx")
+        written = et.convert_files_to_workbook([bad], out)
+        check(written == 0, f"nichts konvertierbar -> written={written}")
+        names = load_workbook(out).sheetnames
+        check(names == ["Leer"], f"Platzhalter-Blatt statt Crash -> {names}")
+
+
+def test_run_in_background_smoke():
+    print("test_run_in_background_smoke")
+    import threading as _t
+    done = _t.Event()
+    result = {}
+
+    def work():
+        result["ran"] = True
+        done.set()
+
+    started = et._run_in_background(work)
+    check(started, "Task gestartet")
+    check(done.wait(timeout=5), "work() im Hintergrund-Thread ausgeführt")
+    check(result.get("ran") is True, "Seiteneffekt sichtbar")
+    # Flag muss zurückgesetzt werden (kurz pollen, da finally im Thread läuft)
+    for _ in range(50):
+        if not et._task_running:
+            break
+        time.sleep(0.02)
+    check(not et._task_running, "_task_running nach Abschluss zurückgesetzt")
+
+
 def main():
     tests = [
         test_sanitize_sheet_name,
@@ -242,6 +309,9 @@ def main():
         test_split_csv_file,
         test_strip_protection_xml,
         test_entferne_schutz_integration,
+        test_convert_files_to_workbook,
+        test_convert_empty_creates_placeholder,
+        test_run_in_background_smoke,
     ]
     for t in tests:
         t()

@@ -33,11 +33,94 @@ import math
 import zipfile
 import shutil
 import tempfile
+import threading
+import queue
 import xml.etree.ElementTree as ET
 from openpyxl import load_workbook
 from openpyxl.styles import Font
 import re
 from typing import Dict, Any, List, Tuple, Optional
+
+
+# =========================================================
+# Thread-Infrastruktur (nicht-blockierendes UI)
+# =========================================================
+
+# Wird in main() gesetzt; hier vordefiniert, damit Hintergrund-Threads
+# gefahrlos prüfen können, ob das Fenster (noch) existiert.
+root = None
+
+_ui_queue: "queue.Queue" = queue.Queue()
+_task_running = False
+_pump_after_id = None
+
+
+def _post_ui(fn) -> None:
+    """Reiht eine UI-Aktion ein; sie wird im Main-Thread abgearbeitet."""
+    _ui_queue.put(fn)
+
+
+def _pump_ui_queue() -> None:
+    """Arbeitet eingereihte UI-Aktionen im Main-Thread ab (periodisch)."""
+    global _pump_after_id
+    try:
+        while True:
+            fn = _ui_queue.get_nowait()
+            try:
+                fn()
+            except Exception as e:
+                print(f"UI-Update-Fehler: {e}")
+    except queue.Empty:
+        pass
+    if root is not None:
+        try:
+            _pump_after_id = root.after(80, _pump_ui_queue)
+        except tk.TclError:
+            pass  # Fenster wird gerade geschlossen
+
+
+def _shutdown() -> None:
+    """Sauberes Beenden: laufenden Pump-Timer abbrechen, dann Fenster schließen."""
+    global root, _pump_after_id
+    if root is None:
+        return
+    if _pump_after_id is not None:
+        try:
+            root.after_cancel(_pump_after_id)
+        except Exception:
+            pass
+        _pump_after_id = None
+    win, root = root, None
+    try:
+        win.destroy()
+    except Exception:
+        pass
+
+
+def _run_in_background(work) -> bool:
+    """
+    Führt work() in einem Daemon-Thread aus (nicht-blockierendes UI).
+    work() darf Tk-Widgets ausschließlich über _post_ui(...) ansprechen.
+    Parallele Tasks werden verhindert (gemeinsame Fortschrittsanzeige/Status).
+    Gibt False zurück, wenn bereits ein Task läuft.
+    """
+    global _task_running
+    if _task_running:
+        messagebox.showinfo("Bitte warten", "Es läuft bereits eine Verarbeitung.")
+        return False
+    _task_running = True
+
+    def runner():
+        global _task_running
+        try:
+            work()
+        except Exception as e:
+            _post_ui(lambda e=e: messagebox.showerror("Fehler", f"Unerwarteter Fehler: {e}"))
+        finally:
+            _task_running = False
+
+    threading.Thread(target=runner, daemon=True).start()
+    return True
 
 
 # =========================================================
@@ -184,26 +267,18 @@ def select_files_convert(listbox: tk.Listbox, status_label: ttk.Label,
     status_label.config(text=f"{len(selected_files_convert)} Datei(en) ausgewählt.")
 
 
-def csv_xls_to_excel(progress_bar: ttk.Progressbar, status_label: ttk.Label) -> None:
-    if not selected_files_convert:
-        messagebox.showerror("Fehler", "Keine Dateien ausgewählt!")
-        return
-    save_path = filedialog.asksaveasfilename(
-        defaultextension=".xlsx",
-        title="Zieldatei speichern unter",
-        filetypes=[("Excel-Datei", "*.xlsx")]
-    )
-    if not save_path:
-        return
-    status_label.config(text="Verarbeite Dateien…")
-    progress_bar["maximum"] = len(selected_files_convert)
-    progress_bar["value"] = 0
-    root.update_idletasks()
-
+def convert_files_to_workbook(files: List[str], save_path: str,
+                              progress=None, on_file_error=None) -> int:
+    """
+    Reine Konvertierungslogik (ohne GUI, damit headless testbar):
+    Schreibt alle Dateien/Sheets als Reiter in eine Excel-Datei und gibt die
+    Anzahl geschriebener Blätter zurück. ``progress(i)`` und
+    ``on_file_error(datei, exc)`` sind optionale Callbacks.
+    """
     used_names = set()
     written = 0
     with pd.ExcelWriter(save_path, engine='openpyxl') as writer:
-        for i, file in enumerate(selected_files_convert, start=1):
+        for i, file in enumerate(files, start=1):
             ext = os.path.splitext(file)[1].lower()
             base = os.path.splitext(os.path.basename(file))[0]
             try:
@@ -233,9 +308,10 @@ def csv_xls_to_excel(progress_bar: ttk.Progressbar, status_label: ttk.Label) -> 
                         df.to_excel(writer, sheet_name=sheet_name, index=False)
                         written += 1
             except Exception as e:
-                messagebox.showerror("Fehler", f"Fehler bei {file}: {e}")
-            progress_bar["value"] = i
-            root.update_idletasks()
+                if on_file_error:
+                    on_file_error(file, e)
+            if progress:
+                progress(i)
 
         # Ohne mindestens ein Blatt kann openpyxl die Mappe nicht speichern
         if written == 0:
@@ -243,14 +319,44 @@ def csv_xls_to_excel(progress_bar: ttk.Progressbar, status_label: ttk.Label) -> 
                 writer, sheet_name="Leer", index=False)
 
     format_excel(save_path)
-    if written == 0:
-        status_label.config(text="Keine Daten konvertiert.")
-        messagebox.showwarning(
-            "Hinweis", "Es konnten keine Daten konvertiert werden.\n"
-                       "Bitte Eingabedateien prüfen.")
+    return written
+
+
+def csv_xls_to_excel(progress_bar: ttk.Progressbar, status_label: ttk.Label) -> None:
+    if not selected_files_convert:
+        messagebox.showerror("Fehler", "Keine Dateien ausgewählt!")
         return
-    status_label.config(text=f"Fertig! Datei gespeichert: {save_path}")
-    messagebox.showinfo("Erfolg", f"Excel-Datei erstellt: {save_path}")
+    save_path = filedialog.asksaveasfilename(
+        defaultextension=".xlsx",
+        title="Zieldatei speichern unter",
+        filetypes=[("Excel-Datei", "*.xlsx")]
+    )
+    if not save_path:
+        return
+    files = list(selected_files_convert)
+    status_label.config(text="Verarbeite Dateien…")
+    progress_bar["maximum"] = len(files)
+    progress_bar["value"] = 0
+
+    def work():
+        def progress(i):
+            _post_ui(lambda i=i: progress_bar.config(value=i))
+
+        def on_file_error(file, e):
+            _post_ui(lambda file=file, e=e:
+                     messagebox.showerror("Fehler", f"Fehler bei {file}: {e}"))
+
+        written = convert_files_to_workbook(files, save_path, progress, on_file_error)
+        if written == 0:
+            _post_ui(lambda: status_label.config(text="Keine Daten konvertiert."))
+            _post_ui(lambda: messagebox.showwarning(
+                "Hinweis", "Es konnten keine Daten konvertiert werden.\n"
+                           "Bitte Eingabedateien prüfen."))
+        else:
+            _post_ui(lambda: status_label.config(text=f"Fertig! Datei gespeichert: {save_path}"))
+            _post_ui(lambda: messagebox.showinfo("Erfolg", f"Excel-Datei erstellt: {save_path}"))
+
+    _run_in_background(work)
 
 
 # =========================================================
@@ -353,25 +459,31 @@ def entferne_schutz_on_file(xlsx_or_xls_path: str) -> Tuple[bool, str]:
 def remove_protection_batch(progress_bar: ttk.Progressbar, status_label: ttk.Label) -> None:
     if not selected_files_protect:
         return
+    files = list(selected_files_protect)
     status_label.config(text="Entferne Blattschutz…")
-    root.update_idletasks()
-    progress_bar["maximum"] = len(selected_files_protect)
+    progress_bar["maximum"] = len(files)
     progress_bar["value"] = 0
-    results = []
-    for i, file in enumerate(selected_files_protect, start=1):
-        ok, msg = entferne_schutz_on_file(file)
-        results.append((file, ok, msg))
-        progress_bar["value"] = i
-        root.update_idletasks()
-    success = [r for r in results if r[1]]
-    fail = [r for r in results if not r[1]]
-    info_text = ""
-    if success:
-        info_text += "Erfolgreich entschützt:\n" + "\n".join([f"- {r[2]}" for r in success]) + "\n\n"
-    if fail:
-        info_text += "Fehlgeschlagen:\n" + "\n".join([f"- {r[0]}: {r[2]}" for r in fail])
-    status_label.config(text="Entschützen abgeschlossen.")
-    messagebox.showinfo("Ergebnis", info_text or "Keine Ergebnisse.")
+
+    def work():
+        results = []
+        for i, file in enumerate(files, start=1):
+            ok, msg = entferne_schutz_on_file(file)
+            results.append((file, ok, msg))
+            _post_ui(lambda i=i: progress_bar.config(value=i))
+        success = [r for r in results if r[1]]
+        fail = [r for r in results if not r[1]]
+        info_text = ""
+        if success:
+            info_text += "Erfolgreich entschützt:\n" + "\n".join(
+                [f"- {r[2]}" for r in success]) + "\n\n"
+        if fail:
+            info_text += "Fehlgeschlagen:\n" + "\n".join(
+                [f"- {r[0]}: {r[2]}" for r in fail])
+        _post_ui(lambda: status_label.config(text="Entschützen abgeschlossen."))
+        _post_ui(lambda info_text=info_text:
+                 messagebox.showinfo("Ergebnis", info_text or "Keine Ergebnisse."))
+
+    _run_in_background(work)
 
 
 # =========================================================
@@ -992,28 +1104,36 @@ def run_split(chunk_size_var: tk.IntVar, progress_bar: ttk.Progressbar,
         messagebox.showerror("Fehler", "Zeilenzahl pro Teil muss ≥ 1 sein.")
         return
 
+    files = list(selected_files_split)
+
     def log(msg):
-        log_widget.config(state="normal")
-        log_widget.insert("end", msg + "\n")
-        log_widget.see("end")
-        log_widget.config(state="disabled")
+        def _do():
+            log_widget.config(state="normal")
+            log_widget.insert("end", msg + "\n")
+            log_widget.see("end")
+            log_widget.config(state="disabled")
+        _post_ui(_do)
 
-    progress_bar.config(value=0, maximum=len(selected_files_split))
+    progress_bar.config(value=0, maximum=len(files))
     status_label.config(text="Splitte CSV-Dateien…")
-    total_parts = 0
 
-    for i, file_path in enumerate(selected_files_split, 1):
-        log(f"\n→ {os.path.basename(file_path)}")
-        try:
-            parts = split_csv_file(file_path, chunk_size, log)
-            total_parts += parts
-        except Exception as e:
-            log(f"  ✖ Fehler: {e}")
-        progress_bar.config(value=i)
-        root.update_idletasks()
+    def work():
+        total_parts = 0
+        for i, file_path in enumerate(files, 1):
+            log(f"\n→ {os.path.basename(file_path)}")
+            try:
+                parts = split_csv_file(file_path, chunk_size, log)
+                total_parts += parts
+            except Exception as e:
+                log(f"  ✖ Fehler: {e}")
+            _post_ui(lambda i=i: progress_bar.config(value=i))
+        _post_ui(lambda total_parts=total_parts:
+                 status_label.config(text=f"Fertig: {total_parts} Teildatei(en) erzeugt."))
+        _post_ui(lambda total_parts=total_parts: messagebox.showinfo(
+            "CSV-Splitter",
+            f"{total_parts} Teildatei(en) erzeugt.\nAusgabe im jeweiligen Quellordner."))
 
-    status_label.config(text=f"Fertig: {total_parts} Teildatei(en) erzeugt.")
-    messagebox.showinfo("CSV-Splitter", f"{total_parts} Teildatei(en) erzeugt.\nAusgabe im jeweiligen Quellordner.")
+    _run_in_background(work)
 
 
 # =========================================================
@@ -1317,6 +1437,11 @@ def main():
     status_frame.pack(fill="x", padx=10, pady=5)
     status_label_global.pack(side="left")
     progress_bar_global.pack(side="right")
+
+    # Sauberes Beenden (Pump-Timer abbrechen) beim Schließen des Fensters
+    root.protocol("WM_DELETE_WINDOW", _shutdown)
+    # Hintergrund-Tasks melden UI-Updates über diese Pumpe zurück
+    _pump_ui_queue()
     root.mainloop()
 
 
