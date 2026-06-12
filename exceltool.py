@@ -14,7 +14,15 @@ Hinweise:
 
 BUGFIX: Syntaxfehler in analyze_text() – unterminated string literals repariert
         (echte Newlines in Strings ersetzt durch \\n Escape-Sequenzen)
+
+Verbesserungen (siehe Commit-History):
+  * Blattschutz-Entfernung ist jetzt namespace-sicher (kein Neuschreiben des
+    kompletten XML mehr -> keine beschädigten Dateien)
+  * GUI-Aufbau in main() gekapselt -> Modul ist ohne Display importier-/testbar
+  * diverse Bugfixes (Encoding-Fallback, leere Zielmappe, Exception-Typ)
 """
+
+from __future__ import annotations
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -24,6 +32,7 @@ import csv
 import math
 import zipfile
 import shutil
+import tempfile
 import xml.etree.ElementTree as ET
 from openpyxl import load_workbook
 from openpyxl.styles import Font
@@ -110,9 +119,9 @@ selected_files_convert: List[str] = []
 def detect_delimiter(file_path: str) -> str:
     """Erkennt automatisch das Trennzeichen einer CSV."""
     try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            sample = f.read(2048)
-            dialect = csv.Sniffer().sniff(sample)
+        with open(file_path, 'r', encoding='utf-8-sig') as f:
+            sample = f.read(4096)
+            dialect = csv.Sniffer().sniff(sample, delimiters=',;\t|')
             return dialect.delimiter
     except Exception:
         for delimiter in [',', ';', '\t', '|']:
@@ -125,7 +134,7 @@ def detect_delimiter(file_path: str) -> str:
 
 
 def read_csv_with_encoding_fallback(path: str, delimiter: str) -> pd.DataFrame:
-    for enc in ['utf-8', 'iso-8859-1', 'cp1252']:
+    for enc in ['utf-8-sig', 'utf-8', 'iso-8859-1', 'cp1252']:
         try:
             return pd.read_csv(path, delimiter=delimiter, encoding=enc, on_bad_lines='skip')
         except UnicodeDecodeError:
@@ -192,6 +201,7 @@ def csv_xls_to_excel(progress_bar: ttk.Progressbar, status_label: ttk.Label) -> 
     root.update_idletasks()
 
     used_names = set()
+    written = 0
     with pd.ExcelWriter(save_path, engine='openpyxl') as writer:
         for i, file in enumerate(selected_files_convert, start=1):
             ext = os.path.splitext(file)[1].lower()
@@ -213,6 +223,7 @@ def csv_xls_to_excel(progress_bar: ttk.Progressbar, status_label: ttk.Label) -> 
                         )
                     sheet_name = sanitize_sheet_name(base, used_names)
                     df.to_excel(writer, sheet_name=sheet_name, index=False)
+                    written += 1
                 elif ext in [".xls", ".xlsx"]:
                     engine = "openpyxl" if ext == ".xlsx" else "xlrd"
                     sheets = pd.read_excel(file, sheet_name=None, engine=engine)
@@ -220,11 +231,24 @@ def csv_xls_to_excel(progress_bar: ttk.Progressbar, status_label: ttk.Label) -> 
                         combined = f"{base}_{sh_name}"
                         sheet_name = sanitize_sheet_name(combined, used_names)
                         df.to_excel(writer, sheet_name=sheet_name, index=False)
+                        written += 1
             except Exception as e:
                 messagebox.showerror("Fehler", f"Fehler bei {file}: {e}")
             progress_bar["value"] = i
             root.update_idletasks()
+
+        # Ohne mindestens ein Blatt kann openpyxl die Mappe nicht speichern
+        if written == 0:
+            pd.DataFrame({"Hinweis": ["Keine konvertierbaren Daten gefunden."]}).to_excel(
+                writer, sheet_name="Leer", index=False)
+
     format_excel(save_path)
+    if written == 0:
+        status_label.config(text="Keine Daten konvertiert.")
+        messagebox.showwarning(
+            "Hinweis", "Es konnten keine Daten konvertiert werden.\n"
+                       "Bitte Eingabedateien prüfen.")
+        return
     status_label.config(text=f"Fertig! Datei gespeichert: {save_path}")
     messagebox.showinfo("Erfolg", f"Excel-Datei erstellt: {save_path}")
 
@@ -254,71 +278,76 @@ def select_files_protect(listbox: tk.Listbox, status_label: ttk.Label,
     )
 
 
+def _strip_protection_xml(xml_bytes: bytes) -> bytes:
+    """
+    Entfernt Schutz-Elemente (sheetProtection / workbookProtection / fileSharing)
+    rein textuell aus einer OOXML-XML-Datei.
+
+    Bewusst KEIN Re-Parsing/Neuschreiben via ElementTree: dabei würden
+    Namespace-Präfixe umbenannt (z. B. mc:Ignorable-Referenzen), was Excel als
+    "unlesbaren Inhalt" markiert. Die textuelle Variante lässt die restliche
+    Struktur unverändert.
+    """
+    try:
+        text = xml_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        return xml_bytes
+    for tag in ("sheetProtection", "workbookProtection", "fileSharing"):
+        # Leere Elemente (Normalfall), optionaler Namespace-Präfix
+        text = re.sub(rf'<(?:\w+:)?{tag}\b[^>]*?/>', '', text)
+        # Selten: Element mit explizitem End-Tag
+        text = re.sub(rf'<(?:\w+:)?{tag}\b[^>]*?>.*?</(?:\w+:)?{tag}>', '', text,
+                      flags=re.DOTALL)
+    return text.encode("utf-8")
+
+
 def entferne_schutz_on_file(xlsx_or_xls_path: str) -> Tuple[bool, str]:
     """
-    Entfernt Sheet- und Workbook-Schutz durch Bearbeiten der OOXML-Struktur.
-    Bei .xls (BIFF) wird die Datei zunächst nach .xlsx konvertiert.
+    Entfernt Sheet- und Workbook-Schutz, indem nur die betroffenen XML-Teile der
+    OOXML-Datei textuell bereinigt werden; alle übrigen ZIP-Einträge bleiben
+    unverändert erhalten. Bei .xls (BIFF) wird zuvor nach .xlsx konvertiert.
     """
     ext = os.path.splitext(xlsx_or_xls_path)[1].lower()
-    if ext == ".xls":
-        try:
-            temp_xlsx = os.path.splitext(xlsx_or_xls_path)[0] + "_temp_convert.xlsx"
-            sheets = pd.read_excel(xlsx_or_xls_path, sheet_name=None, engine="xlrd")
-            with pd.ExcelWriter(temp_xlsx, engine="openpyxl") as writer:
-                for name, df in sheets.items():
-                    df.to_excel(writer, sheet_name=str(name)[:31], index=False)
-            source_for_zip = temp_xlsx
-        except Exception as e:
-            return False, f"Konvertierung von .xls fehlgeschlagen: {e}"
-    else:
-        source_for_zip = xlsx_or_xls_path
+    out_dir = os.path.dirname(xlsx_or_xls_path)
+    base = os.path.splitext(os.path.basename(xlsx_or_xls_path))[0]
+    neue_datei = os.path.join(out_dir, base + "_entschuetzt.xlsx")
 
+    tmp_dir = tempfile.mkdtemp(prefix="entschuetzt_")
     try:
-        basisname = os.path.splitext(os.path.basename(source_for_zip))[0]
-        ordner = os.path.dirname(source_for_zip)
-        neue_datei = os.path.join(ordner, basisname + "_entschuetzt.xlsx")
-        temp_ordner = os.path.join(ordner, basisname + "_temp_ooxml")
-
-        with zipfile.ZipFile(source_for_zip, 'r') as zip_ref:
-            zip_ref.extractall(temp_ordner)
-
-        # Blattschutz entfernen
-        worksheets_ordner = os.path.join(temp_ordner, "xl", "worksheets")
-        if os.path.isdir(worksheets_ordner):
-            for datei in os.listdir(worksheets_ordner):
-                if datei.endswith(".xml"):
-                    pfad = os.path.join(worksheets_ordner, datei)
-                    tree = ET.parse(pfad)
-                    root_xml = tree.getroot()
-                    ns = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
-                    for elem in root_xml.findall(f"{ns}sheetProtection"):
-                        root_xml.remove(elem)
-                    tree.write(pfad)
-
-        # Arbeitsmappenschutz entfernen
-        workbook_pfad = os.path.join(temp_ordner, "xl", "workbook.xml")
-        if os.path.exists(workbook_pfad):
-            tree = ET.parse(workbook_pfad)
-            root_xml = tree.getroot()
-            ns = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
-            for elem in root_xml.findall(f"{ns}workbookProtection"):
-                root_xml.remove(elem)
-            tree.write(workbook_pfad)
-
-        # Wieder packen
-        zip_pfad = os.path.join(ordner, basisname + "_entschuetzt.zip")
-        shutil.make_archive(zip_pfad.replace(".zip", ""), 'zip', temp_ordner)
-        shutil.move(zip_pfad, neue_datei)
-        shutil.rmtree(temp_ordner)
-
         if ext == ".xls":
             try:
-                os.remove(source_for_zip)
-            except Exception:
-                pass
+                source_for_zip = os.path.join(tmp_dir, base + ".xlsx")
+                sheets = pd.read_excel(xlsx_or_xls_path, sheet_name=None, engine="xlrd")
+                with pd.ExcelWriter(source_for_zip, engine="openpyxl") as writer:
+                    for name, df in sheets.items():
+                        df.to_excel(writer, sheet_name=str(name)[:31], index=False)
+            except Exception as e:
+                return False, f"Konvertierung von .xls fehlgeschlagen: {e}"
+        elif ext == ".xlsx":
+            source_for_zip = xlsx_or_xls_path
+        else:
+            return False, f"Nicht unterstütztes Format: {ext}"
+
+        # ZIP einlesen, Schutz-Elemente entfernen, neues ZIP schreiben
+        with zipfile.ZipFile(source_for_zip, "r") as zin:
+            entries = zin.infolist()
+            payload = {info.filename: zin.read(info.filename) for info in entries}
+
+        for name in payload:
+            if (name.startswith("xl/worksheets/") and name.endswith(".xml")) \
+                    or name == "xl/workbook.xml":
+                payload[name] = _strip_protection_xml(payload[name])
+
+        with zipfile.ZipFile(neue_datei, "w", zipfile.ZIP_DEFLATED) as zout:
+            for info in entries:
+                # ZipInfo erhält Zeitstempel/Kompressionstyp des Originals
+                zout.writestr(info, payload[info.filename])
+
         return True, neue_datei
     except Exception as e:
         return False, str(e)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def remove_protection_batch(progress_bar: ttk.Progressbar, status_label: ttk.Label) -> None:
@@ -919,7 +948,9 @@ def split_csv_file(file_path: str, chunk_size: int, log_fn) -> int:
     Gibt Anzahl erzeugter Dateien zurück.
     Encoding-Fallback: utf-8 → iso-8859-1 → cp1252.
     """
-    for enc in ["utf-8", "iso-8859-1", "cp1252"]:
+    header: List[str] = []
+    rows: List[List[str]] = []
+    for enc in ["utf-8-sig", "utf-8", "iso-8859-1", "cp1252"]:
         try:
             with open(file_path, "r", encoding=enc, newline="") as f:
                 reader = csv.reader(f)
@@ -929,7 +960,7 @@ def split_csv_file(file_path: str, chunk_size: int, log_fn) -> int:
         except UnicodeDecodeError:
             continue
     else:
-        raise UnicodeDecodeError(f"Konnte {file_path} mit keinem Encoding lesen.")
+        raise RuntimeError(f"Konnte {file_path} mit keinem bekannten Encoding lesen.")
 
     base_name = os.path.splitext(os.path.basename(file_path))[0]
     out_dir   = os.path.dirname(file_path)
@@ -1099,194 +1130,198 @@ def preview_xml(xml_input: tk.Text, preview_widget: tk.Text) -> None:
 # GUI Aufbau
 # =========================================================
 
-root = tk.Tk()
-root.title("Excel-Toolbox: CSV→Excel | Blattschutz | Parser | CSV-Splitter | XML→CSV")
-root.geometry("1000x740")
+def main():
+    global root
+    root = tk.Tk()
+    root.title("Excel-Toolbox: CSV→Excel | Blattschutz | Parser | CSV-Splitter | XML→CSV")
+    root.geometry("1000x740")
 
-tab_control = ttk.Notebook(root)
-tab_csv     = ttk.Frame(tab_control)
-tab_protect = ttk.Frame(tab_control)
-tab_parser  = ttk.Frame(tab_control)
-tab_split   = ttk.Frame(tab_control)
-tab_xml2csv = ttk.Frame(tab_control)
+    tab_control = ttk.Notebook(root)
+    tab_csv     = ttk.Frame(tab_control)
+    tab_protect = ttk.Frame(tab_control)
+    tab_parser  = ttk.Frame(tab_control)
+    tab_split   = ttk.Frame(tab_control)
+    tab_xml2csv = ttk.Frame(tab_control)
 
-tab_control.add(tab_csv,     text="📂 CSV/XLS/XLSX → Excel")
-tab_control.add(tab_protect, text="🔓 Blattschutz entfernen")
-tab_control.add(tab_parser,  text="📄 OpenTrans/ORDERS05/EDIFACT")
-tab_control.add(tab_split,   text="✂ CSV-Splitter")
-tab_control.add(tab_xml2csv, text="🔄 XML → CSV")
-tab_control.pack(expand=1, fill="both")
+    tab_control.add(tab_csv,     text="📂 CSV/XLS/XLSX → Excel")
+    tab_control.add(tab_protect, text="🔓 Blattschutz entfernen")
+    tab_control.add(tab_parser,  text="📄 OpenTrans/ORDERS05/EDIFACT")
+    tab_control.add(tab_split,   text="✂ CSV-Splitter")
+    tab_control.add(tab_xml2csv, text="🔄 XML → CSV")
+    tab_control.pack(expand=1, fill="both")
 
-# --- Tab 1: Konverter ---
-frame_csv_top = ttk.Frame(tab_csv)
-frame_csv_top.pack(fill="x", padx=10, pady=10)
-ttk.Label(frame_csv_top,
-          text="Wähle CSV/XLS/XLSX-Dateien und füge alle als Reiter in eine Excel-Datei zusammen."
-          ).pack(side="left")
+    # --- Tab 1: Konverter ---
+    frame_csv_top = ttk.Frame(tab_csv)
+    frame_csv_top.pack(fill="x", padx=10, pady=10)
+    ttk.Label(frame_csv_top,
+              text="Wähle CSV/XLS/XLSX-Dateien und füge alle als Reiter in eine Excel-Datei zusammen."
+              ).pack(side="left")
 
-convert_listbox = tk.Listbox(tab_csv, height=12)
-convert_listbox.pack(fill="both", expand=True, padx=10, pady=5)
+    convert_listbox = tk.Listbox(tab_csv, height=12)
+    convert_listbox.pack(fill="both", expand=True, padx=10, pady=5)
 
-frame_csv_bottom = ttk.Frame(tab_csv)
-frame_csv_bottom.pack(fill="x", padx=10, pady=10)
+    frame_csv_bottom = ttk.Frame(tab_csv)
+    frame_csv_bottom.pack(fill="x", padx=10, pady=10)
 
-status_label_global = ttk.Label(root, text="", foreground="blue")
-progress_bar_global = ttk.Progressbar(root, length=400, mode="determinate")
+    status_label_global = ttk.Label(root, text="", foreground="blue")
+    progress_bar_global = ttk.Progressbar(root, length=400, mode="determinate")
 
-btn_run_convert = ttk.Button(
-    frame_csv_bottom, text="Zusammenführen & Speichern…",
-    command=lambda: csv_xls_to_excel(progress_bar_global, status_label_global),
-    state="disabled"
-)
-btn_select_convert = ttk.Button(
-    frame_csv_bottom, text="Dateien auswählen…",
-    command=lambda: select_files_convert(convert_listbox, status_label_global, btn_run_convert)
-)
-btn_select_convert.pack(side="left")
-btn_run_convert.pack(side="left", padx=10)
+    btn_run_convert = ttk.Button(
+        frame_csv_bottom, text="Zusammenführen & Speichern…",
+        command=lambda: csv_xls_to_excel(progress_bar_global, status_label_global),
+        state="disabled"
+    )
+    btn_select_convert = ttk.Button(
+        frame_csv_bottom, text="Dateien auswählen…",
+        command=lambda: select_files_convert(convert_listbox, status_label_global, btn_run_convert)
+    )
+    btn_select_convert.pack(side="left")
+    btn_run_convert.pack(side="left", padx=10)
 
-# --- Tab 2: Schutz entfernen ---
-frame_protect_top = ttk.Frame(tab_protect)
-frame_protect_top.pack(fill="x", padx=10, pady=10)
-ttk.Label(frame_protect_top,
-          text="Wähle Excel-Dateien (.xls/.xlsx), um Blattschutz/Arbeitsmappenschutz zu entfernen."
-          ).pack(side="left")
+    # --- Tab 2: Schutz entfernen ---
+    frame_protect_top = ttk.Frame(tab_protect)
+    frame_protect_top.pack(fill="x", padx=10, pady=10)
+    ttk.Label(frame_protect_top,
+              text="Wähle Excel-Dateien (.xls/.xlsx), um Blattschutz/Arbeitsmappenschutz zu entfernen."
+              ).pack(side="left")
 
-protect_listbox = tk.Listbox(tab_protect, height=12)
-protect_listbox.pack(fill="both", expand=True, padx=10, pady=5)
+    protect_listbox = tk.Listbox(tab_protect, height=12)
+    protect_listbox.pack(fill="both", expand=True, padx=10, pady=5)
 
-frame_protect_bottom = ttk.Frame(tab_protect)
-frame_protect_bottom.pack(fill="x", padx=10, pady=10)
+    frame_protect_bottom = ttk.Frame(tab_protect)
+    frame_protect_bottom.pack(fill="x", padx=10, pady=10)
 
-btn_run_protect = ttk.Button(
-    frame_protect_bottom, text="Blattschutz entfernen (Stapellauf)",
-    command=lambda: remove_protection_batch(progress_bar_global, status_label_global),
-    state="disabled"
-)
-btn_select_protect = ttk.Button(
-    frame_protect_bottom, text="Excel-Dateien auswählen…",
-    command=lambda: select_files_protect(protect_listbox, status_label_global, btn_run_protect)
-)
-btn_select_protect.pack(side="left")
-btn_run_protect.pack(side="left", padx=10)
+    btn_run_protect = ttk.Button(
+        frame_protect_bottom, text="Blattschutz entfernen (Stapellauf)",
+        command=lambda: remove_protection_batch(progress_bar_global, status_label_global),
+        state="disabled"
+    )
+    btn_select_protect = ttk.Button(
+        frame_protect_bottom, text="Excel-Dateien auswählen…",
+        command=lambda: select_files_protect(protect_listbox, status_label_global, btn_run_protect)
+    )
+    btn_select_protect.pack(side="left")
+    btn_run_protect.pack(side="left", padx=10)
 
-# --- Tab 3: Parser ---
-frame_parser_top = ttk.Frame(tab_parser)
-frame_parser_top.pack(fill="x", padx=10, pady=10)
-ttk.Label(frame_parser_top,
-          text="OpenTrans-XML, SAP IDoc ORDERS05-XML oder EDIFACT-Rohtext einfügen und analysieren."
-          ).pack(side="left")
+    # --- Tab 3: Parser ---
+    frame_parser_top = ttk.Frame(tab_parser)
+    frame_parser_top.pack(fill="x", padx=10, pady=10)
+    ttk.Label(frame_parser_top,
+              text="OpenTrans-XML, SAP IDoc ORDERS05-XML oder EDIFACT-Rohtext einfügen und analysieren."
+              ).pack(side="left")
 
-frame_parser_center = ttk.Frame(tab_parser)
-frame_parser_center.pack(fill="both", expand=True, padx=10, pady=5)
-parser_input = tk.Text(frame_parser_center, height=16)
-parser_input.pack(fill="both", expand=True)
+    frame_parser_center = ttk.Frame(tab_parser)
+    frame_parser_center.pack(fill="both", expand=True, padx=10, pady=5)
+    parser_input = tk.Text(frame_parser_center, height=16)
+    parser_input.pack(fill="both", expand=True)
 
-frame_parser_actions = ttk.Frame(tab_parser)
-frame_parser_actions.pack(fill="x", padx=10, pady=5)
+    frame_parser_actions = ttk.Frame(tab_parser)
+    frame_parser_actions.pack(fill="x", padx=10, pady=5)
 
-btn_export_items = ttk.Button(
-    frame_parser_actions, text="Export (Header + Positionen) → Excel…",
-    command=export_items_to_excel, state="disabled"
-)
-btn_analyze = ttk.Button(
-    frame_parser_actions, text="Analysieren",
-    command=lambda: analyze_text(parser_input, parser_output, btn_export_items)
-)
-btn_copy = ttk.Button(
-    frame_parser_actions, text="Zusammenfassung kopieren",
-    command=lambda: copy_summary_to_clipboard(parser_output)
-)
-btn_analyze.pack(side="left")
-btn_copy.pack(side="left", padx=10)
-btn_export_items.pack(side="left", padx=10)
+    btn_export_items = ttk.Button(
+        frame_parser_actions, text="Export (Header + Positionen) → Excel…",
+        command=export_items_to_excel, state="disabled"
+    )
+    btn_analyze = ttk.Button(
+        frame_parser_actions, text="Analysieren",
+        command=lambda: analyze_text(parser_input, parser_output, btn_export_items)
+    )
+    btn_copy = ttk.Button(
+        frame_parser_actions, text="Zusammenfassung kopieren",
+        command=lambda: copy_summary_to_clipboard(parser_output)
+    )
+    btn_analyze.pack(side="left")
+    btn_copy.pack(side="left", padx=10)
+    btn_export_items.pack(side="left", padx=10)
 
-parser_output = tk.Text(tab_parser, height=18, state="disabled")
-parser_output.pack(fill="both", expand=True, padx=10, pady=5)
+    parser_output = tk.Text(tab_parser, height=18, state="disabled")
+    parser_output.pack(fill="both", expand=True, padx=10, pady=5)
 
-# --- Tab 4: CSV-Splitter ---
-ttk.Label(tab_split,
-          text="Teilt große CSV-Dateien in gleichmäßige Blöcke auf.\n"
-               "Jeder Block enthält die Kopfzeile. Ausgabe im Quellordner der Originaldatei."
-          ).pack(anchor="w", padx=10, pady=(10, 4))
+    # --- Tab 4: CSV-Splitter ---
+    ttk.Label(tab_split,
+              text="Teilt große CSV-Dateien in gleichmäßige Blöcke auf.\n"
+                   "Jeder Block enthält die Kopfzeile. Ausgabe im Quellordner der Originaldatei."
+              ).pack(anchor="w", padx=10, pady=(10, 4))
 
-frm_split_opts = ttk.LabelFrame(tab_split, text="Einstellungen")
-frm_split_opts.pack(fill="x", padx=10, pady=4)
-ttk.Label(frm_split_opts, text="Zeilen pro Datei:").grid(row=0, column=0, sticky="w", padx=8, pady=6)
-split_chunk_var = tk.IntVar(value=2000)
-ttk.Spinbox(frm_split_opts, from_=100, to=100000, increment=500,
-            textvariable=split_chunk_var, width=10).grid(row=0, column=1, sticky="w", padx=6, pady=6)
-ttk.Label(frm_split_opts, text="(Standard: 2000 – passend für viele Shop-Importe)").grid(
-    row=0, column=2, sticky="w", padx=6)
+    frm_split_opts = ttk.LabelFrame(tab_split, text="Einstellungen")
+    frm_split_opts.pack(fill="x", padx=10, pady=4)
+    ttk.Label(frm_split_opts, text="Zeilen pro Datei:").grid(row=0, column=0, sticky="w", padx=8, pady=6)
+    split_chunk_var = tk.IntVar(value=2000)
+    ttk.Spinbox(frm_split_opts, from_=100, to=100000, increment=500,
+                textvariable=split_chunk_var, width=10).grid(row=0, column=1, sticky="w", padx=6, pady=6)
+    ttk.Label(frm_split_opts, text="(Standard: 2000 – passend für viele Shop-Importe)").grid(
+        row=0, column=2, sticky="w", padx=6)
 
-split_listbox = tk.Listbox(tab_split, height=7)
-split_listbox.pack(fill="both", expand=False, padx=10, pady=4)
+    split_listbox = tk.Listbox(tab_split, height=7)
+    split_listbox.pack(fill="both", expand=False, padx=10, pady=4)
 
-frm_split_log = ttk.LabelFrame(tab_split, text="Protokoll")
-frm_split_log.pack(fill="both", expand=True, padx=10, pady=4)
-split_log = tk.Text(frm_split_log, height=8, state="disabled")
-split_log.pack(fill="both", expand=True, padx=5, pady=5)
+    frm_split_log = ttk.LabelFrame(tab_split, text="Protokoll")
+    frm_split_log.pack(fill="both", expand=True, padx=10, pady=4)
+    split_log = tk.Text(frm_split_log, height=8, state="disabled")
+    split_log.pack(fill="both", expand=True, padx=5, pady=5)
 
-frm_split_btn = ttk.Frame(tab_split)
-frm_split_btn.pack(fill="x", padx=10, pady=6)
+    frm_split_btn = ttk.Frame(tab_split)
+    frm_split_btn.pack(fill="x", padx=10, pady=6)
 
-btn_run_split = ttk.Button(
-    frm_split_btn, text="Splitten",
-    command=lambda: run_split(split_chunk_var, progress_bar_global, status_label_global, split_log),
-    state="disabled"
-)
-btn_select_split = ttk.Button(
-    frm_split_btn, text="CSV-Dateien auswählen…",
-    command=lambda: select_files_split(split_listbox, status_label_global, btn_run_split)
-)
-btn_select_split.pack(side="left")
-btn_run_split.pack(side="left", padx=10)
+    btn_run_split = ttk.Button(
+        frm_split_btn, text="Splitten",
+        command=lambda: run_split(split_chunk_var, progress_bar_global, status_label_global, split_log),
+        state="disabled"
+    )
+    btn_select_split = ttk.Button(
+        frm_split_btn, text="CSV-Dateien auswählen…",
+        command=lambda: select_files_split(split_listbox, status_label_global, btn_run_split)
+    )
+    btn_select_split.pack(side="left")
+    btn_run_split.pack(side="left", padx=10)
 
-# --- Tab 5: XML → CSV ---
-ttk.Label(tab_xml2csv,
-          text="Liest ein XML-Fragment mit <PARAMETER DISPLAYNAME=\"...\">Wert</PARAMETER>\n"
-               "und exportiert es als CSV. Typisch für ETC-Partner-Daten aus der Zwischenablage."
-          ).pack(anchor="w", padx=10, pady=(10, 4))
+    # --- Tab 5: XML → CSV ---
+    ttk.Label(tab_xml2csv,
+              text="Liest ein XML-Fragment mit <PARAMETER DISPLAYNAME=\"...\">Wert</PARAMETER>\n"
+                   "und exportiert es als CSV. Typisch für ETC-Partner-Daten aus der Zwischenablage."
+              ).pack(anchor="w", padx=10, pady=(10, 4))
 
-frm_xml_opts = ttk.LabelFrame(tab_xml2csv, text="Einstellungen")
-frm_xml_opts.pack(fill="x", padx=10, pady=4)
-ttk.Label(frm_xml_opts, text="Trennzeichen:").grid(row=0, column=0, sticky="w", padx=8, pady=6)
-xml_sep_var = tk.StringVar(value=";")
-sep_box = ttk.Combobox(frm_xml_opts, values=[";", ",", "\t", "|"],
-                       textvariable=xml_sep_var, width=6, state="normal")
-sep_box.grid(row=0, column=1, sticky="w", padx=6, pady=6)
-ttk.Label(frm_xml_opts, text="(Standard: Semikolon)").grid(row=0, column=2, sticky="w", padx=6)
+    frm_xml_opts = ttk.LabelFrame(tab_xml2csv, text="Einstellungen")
+    frm_xml_opts.pack(fill="x", padx=10, pady=4)
+    ttk.Label(frm_xml_opts, text="Trennzeichen:").grid(row=0, column=0, sticky="w", padx=8, pady=6)
+    xml_sep_var = tk.StringVar(value=";")
+    sep_box = ttk.Combobox(frm_xml_opts, values=[";", ",", "\t", "|"],
+                           textvariable=xml_sep_var, width=6, state="normal")
+    sep_box.grid(row=0, column=1, sticky="w", padx=6, pady=6)
+    ttk.Label(frm_xml_opts, text="(Standard: Semikolon)").grid(row=0, column=2, sticky="w", padx=6)
 
-frm_xml_input = ttk.LabelFrame(tab_xml2csv, text="XML-Eingabe (einfügen oder Zwischenablage)")
-frm_xml_input.pack(fill="both", expand=True, padx=10, pady=4)
-xml_input = tk.Text(frm_xml_input, height=10, wrap="none")
-xml_input.pack(fill="both", expand=True, padx=5, pady=5)
+    frm_xml_input = ttk.LabelFrame(tab_xml2csv, text="XML-Eingabe (einfügen oder Zwischenablage)")
+    frm_xml_input.pack(fill="both", expand=True, padx=10, pady=4)
+    xml_input = tk.Text(frm_xml_input, height=10, wrap="none")
+    xml_input.pack(fill="both", expand=True, padx=5, pady=5)
 
-frm_xml_preview = ttk.LabelFrame(tab_xml2csv, text="Vorschau erkannter Felder")
-frm_xml_preview.pack(fill="both", expand=True, padx=10, pady=4)
-xml_preview = tk.Text(frm_xml_preview, height=7, state="disabled",
-                      font=("Courier New", 9))
-xml_preview.pack(fill="both", expand=True, padx=5, pady=5)
+    frm_xml_preview = ttk.LabelFrame(tab_xml2csv, text="Vorschau erkannter Felder")
+    frm_xml_preview.pack(fill="both", expand=True, padx=10, pady=4)
+    xml_preview = tk.Text(frm_xml_preview, height=7, state="disabled",
+                          font=("Courier New", 9))
+    xml_preview.pack(fill="both", expand=True, padx=5, pady=5)
 
-frm_xml_btn = ttk.Frame(tab_xml2csv)
-frm_xml_btn.pack(fill="x", padx=10, pady=6)
-ttk.Button(frm_xml_btn, text="📋 Aus Zwischenablage",
-           command=lambda: paste_from_clipboard(xml_input)).pack(side="left")
-ttk.Button(frm_xml_btn, text="🔍 Vorschau",
-           command=lambda: preview_xml(xml_input, xml_preview)).pack(side="left", padx=8)
-ttk.Button(frm_xml_btn, text="💾 Als CSV speichern…",
-           command=lambda: xml_to_csv_convert(xml_input, xml_preview, xml_sep_var)).pack(side="left")
-ttk.Button(frm_xml_btn, text="🗑 Eingabe leeren",
-           command=lambda: xml_input.delete("1.0", tk.END)).pack(side="right")
+    frm_xml_btn = ttk.Frame(tab_xml2csv)
+    frm_xml_btn.pack(fill="x", padx=10, pady=6)
+    ttk.Button(frm_xml_btn, text="📋 Aus Zwischenablage",
+               command=lambda: paste_from_clipboard(xml_input)).pack(side="left")
+    ttk.Button(frm_xml_btn, text="🔍 Vorschau",
+               command=lambda: preview_xml(xml_input, xml_preview)).pack(side="left", padx=8)
+    ttk.Button(frm_xml_btn, text="💾 Als CSV speichern…",
+               command=lambda: xml_to_csv_convert(xml_input, xml_preview, xml_sep_var)).pack(side="left")
+    ttk.Button(frm_xml_btn, text="🗑 Eingabe leeren",
+               command=lambda: xml_input.delete("1.0", tk.END)).pack(side="right")
 
-# --- Globaler Status ---
-status_frame = ttk.Frame(root)
-status_frame.pack(fill="x", padx=10, pady=5)
-status_label_global.pack(side="left")
-progress_bar_global.pack(side="right")
+    # --- Globaler Status ---
+    status_frame = ttk.Frame(root)
+    status_frame.pack(fill="x", padx=10, pady=5)
+    status_label_global.pack(side="left")
+    progress_bar_global.pack(side="right")
+    root.mainloop()
+
 
 # =========================================================
 # Start
 # =========================================================
 if __name__ == "__main__":
-    root.mainloop()
+    main()
