@@ -1,10 +1,18 @@
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
 .pytest_cache/
-.ruff_cache/
-*.egg-info/
 build/
 dist/
+*.egg-info/
+.venv/
+venv/
+env/
+.vscode/
+.idea/
+*.swp
+
+# projektspezifisch / Launcher-Stamp
+.ruff_cache/
+.venv/pyproject.stamp
 *_entschuetzt.xlsx
 *_part[0-9]*.csv
