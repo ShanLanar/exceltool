@@ -35,11 +35,14 @@ import shutil
 import tempfile
 import threading
 import queue
+import logging
 import xml.etree.ElementTree as ET
 from openpyxl import load_workbook
 from openpyxl.styles import Font
 import re
 from typing import Dict, Any, List, Tuple, Optional
+
+logger = logging.getLogger("exceltool")
 
 
 # =========================================================
@@ -68,8 +71,8 @@ def _pump_ui_queue() -> None:
             fn = _ui_queue.get_nowait()
             try:
                 fn()
-            except Exception as e:
-                print(f"UI-Update-Fehler: {e}")
+            except Exception:
+                logger.exception("UI-Update-Fehler")
     except queue.Empty:
         pass
     if root is not None:
@@ -115,6 +118,7 @@ def _run_in_background(work) -> bool:
         try:
             work()
         except Exception as e:
+            logger.exception("Hintergrund-Task fehlgeschlagen")
             _post_ui(lambda e=e: messagebox.showerror("Fehler", f"Unerwarteter Fehler: {e}"))
         finally:
             _task_running = False
@@ -173,7 +177,7 @@ def format_excel(file_path: str) -> None:
                 ws.column_dimensions[col_letter].width = min(max_len + 2, 60)
         wb.save(file_path)
     except Exception as e:
-        print(f"Warnung: Formatierung nicht vollständig möglich: {e}")
+        logger.warning("Formatierung nicht vollständig möglich: %s", e)
 
 
 def export_to_excel(header_dict: Dict[str, Any], items_list: List[Dict[str, Any]],
@@ -630,17 +634,21 @@ def parse_opentrans_xml(raw: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]],
         net = find_in_item([f".//{ns_tag('NetPrice')}"])
         del_date = find_in_item([f".//{ns_tag('DeliveryDate')}", f".//{ns_tag('EDATU')}"])
         incoterm = find_in_item([f".//{ns_tag('Incoterm')}", f".//{ns_tag('LKOND')}"])
+        unit = find_in_item([f".//{ns_tag('OrderUnit')}", f".//{ns_tag('ORDER_UNIT')}",
+                             f".//{ns_tag('Unit')}", f".//{ns_tag('QuantityUnit')}"])
+        tax = find_in_item([f".//{ns_tag('TaxRate')}", f".//{ns_tag('Tax')}",
+                            f".//{ns_tag('TAX')}", f".//{ns_tag('VatRate')}"])
         items.append({
             "Position": line_no if line_no != "—" else str(pos_counter),
             "Artikelnummer": pid,
             "Beschreibung": name,
             "Menge": qty,
-            "Einheit": "—",
+            "Einheit": unit,
             "Preis": price,
             "Nettowert": net,
             "Lieferdatum": del_date,
             "Incoterm": incoterm,
-            "Steuer": "—",
+            "Steuer": tax,
             "Währung": currency,
         })
 
@@ -1269,11 +1277,37 @@ def preview_xml(xml_input: tk.Text, preview_widget: tk.Text) -> None:
 # GUI Aufbau
 # =========================================================
 
+def _scrolled(parent, factory, pack_kw, horizontal=False):
+    """
+    Bettet ein Listbox-/Text-Widget mit Scrollbar(s) in einen eigenen Rahmen ein.
+    ``factory(frame)`` erzeugt das Widget; ``pack_kw`` platziert den Rahmen im
+    übergeordneten Container (wie zuvor das Widget selbst).
+    """
+    frame = ttk.Frame(parent)
+    frame.pack(**pack_kw)
+    widget = factory(frame)
+    vsb = ttk.Scrollbar(frame, orient="vertical", command=widget.yview)
+    widget.configure(yscrollcommand=vsb.set)
+    widget.grid(row=0, column=0, sticky="nsew")
+    vsb.grid(row=0, column=1, sticky="ns")
+    if horizontal:
+        hsb = ttk.Scrollbar(frame, orient="horizontal", command=widget.xview)
+        widget.configure(xscrollcommand=hsb.set)
+        hsb.grid(row=1, column=0, sticky="ew")
+    frame.rowconfigure(0, weight=1)
+    frame.columnconfigure(0, weight=1)
+    return widget
+
+
 def main():
     global root
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     root = tk.Tk()
     root.title("Excel-Toolbox: CSV→Excel | Blattschutz | Parser | CSV-Splitter | XML→CSV")
     root.geometry("1000x740")
+    root.minsize(820, 600)
 
     tab_control = ttk.Notebook(root)
     tab_csv     = ttk.Frame(tab_control)
@@ -1296,8 +1330,9 @@ def main():
               text="Wähle CSV/XLS/XLSX-Dateien und füge alle als Reiter in eine Excel-Datei zusammen."
               ).pack(side="left")
 
-    convert_listbox = tk.Listbox(tab_csv, height=12)
-    convert_listbox.pack(fill="both", expand=True, padx=10, pady=5)
+    convert_listbox = _scrolled(
+        tab_csv, lambda p: tk.Listbox(p, height=12),
+        dict(fill="both", expand=True, padx=10, pady=5))
 
     frame_csv_bottom = ttk.Frame(tab_csv)
     frame_csv_bottom.pack(fill="x", padx=10, pady=10)
@@ -1324,8 +1359,9 @@ def main():
               text="Wähle Excel-Dateien (.xls/.xlsx), um Blattschutz/Arbeitsmappenschutz zu entfernen."
               ).pack(side="left")
 
-    protect_listbox = tk.Listbox(tab_protect, height=12)
-    protect_listbox.pack(fill="both", expand=True, padx=10, pady=5)
+    protect_listbox = _scrolled(
+        tab_protect, lambda p: tk.Listbox(p, height=12),
+        dict(fill="both", expand=True, padx=10, pady=5))
 
     frame_protect_bottom = ttk.Frame(tab_protect)
     frame_protect_bottom.pack(fill="x", padx=10, pady=10)
@@ -1349,10 +1385,9 @@ def main():
               text="OpenTrans-XML, SAP IDoc ORDERS05-XML oder EDIFACT-Rohtext einfügen und analysieren."
               ).pack(side="left")
 
-    frame_parser_center = ttk.Frame(tab_parser)
-    frame_parser_center.pack(fill="both", expand=True, padx=10, pady=5)
-    parser_input = tk.Text(frame_parser_center, height=16)
-    parser_input.pack(fill="both", expand=True)
+    parser_input = _scrolled(
+        tab_parser, lambda p: tk.Text(p, height=16),
+        dict(fill="both", expand=True, padx=10, pady=5))
 
     frame_parser_actions = ttk.Frame(tab_parser)
     frame_parser_actions.pack(fill="x", padx=10, pady=5)
@@ -1373,8 +1408,9 @@ def main():
     btn_copy.pack(side="left", padx=10)
     btn_export_items.pack(side="left", padx=10)
 
-    parser_output = tk.Text(tab_parser, height=18, state="disabled")
-    parser_output.pack(fill="both", expand=True, padx=10, pady=5)
+    parser_output = _scrolled(
+        tab_parser, lambda p: tk.Text(p, height=18, state="disabled"),
+        dict(fill="both", expand=True, padx=10, pady=5))
 
     # --- Tab 4: CSV-Splitter ---
     ttk.Label(tab_split,
@@ -1391,13 +1427,15 @@ def main():
     ttk.Label(frm_split_opts, text="(Standard: 2000 – passend für viele Shop-Importe)").grid(
         row=0, column=2, sticky="w", padx=6)
 
-    split_listbox = tk.Listbox(tab_split, height=7)
-    split_listbox.pack(fill="both", expand=False, padx=10, pady=4)
+    split_listbox = _scrolled(
+        tab_split, lambda p: tk.Listbox(p, height=7),
+        dict(fill="both", expand=False, padx=10, pady=4))
 
     frm_split_log = ttk.LabelFrame(tab_split, text="Protokoll")
     frm_split_log.pack(fill="both", expand=True, padx=10, pady=4)
-    split_log = tk.Text(frm_split_log, height=8, state="disabled")
-    split_log.pack(fill="both", expand=True, padx=5, pady=5)
+    split_log = _scrolled(
+        frm_split_log, lambda p: tk.Text(p, height=8, state="disabled"),
+        dict(fill="both", expand=True, padx=5, pady=5))
 
     frm_split_btn = ttk.Frame(tab_split)
     frm_split_btn.pack(fill="x", padx=10, pady=6)
@@ -1431,14 +1469,16 @@ def main():
 
     frm_xml_input = ttk.LabelFrame(tab_xml2csv, text="XML-Eingabe (einfügen oder Zwischenablage)")
     frm_xml_input.pack(fill="both", expand=True, padx=10, pady=4)
-    xml_input = tk.Text(frm_xml_input, height=10, wrap="none")
-    xml_input.pack(fill="both", expand=True, padx=5, pady=5)
+    xml_input = _scrolled(
+        frm_xml_input, lambda p: tk.Text(p, height=10, wrap="none"),
+        dict(fill="both", expand=True, padx=5, pady=5), horizontal=True)
 
     frm_xml_preview = ttk.LabelFrame(tab_xml2csv, text="Vorschau erkannter Felder")
     frm_xml_preview.pack(fill="both", expand=True, padx=10, pady=4)
-    xml_preview = tk.Text(frm_xml_preview, height=7, state="disabled",
-                          font=("Courier New", 9))
-    xml_preview.pack(fill="both", expand=True, padx=5, pady=5)
+    xml_preview = _scrolled(
+        frm_xml_preview, lambda p: tk.Text(p, height=7, state="disabled",
+                                           font=("Courier New", 9)),
+        dict(fill="both", expand=True, padx=5, pady=5), horizontal=True)
 
     frm_xml_btn = ttk.Frame(tab_xml2csv)
     frm_xml_btn.pack(fill="x", padx=10, pady=6)

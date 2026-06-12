@@ -134,7 +134,9 @@ def test_parse_opentrans_xml():
                 <ProductID>ART-1</ProductID>
                 <ProductName>Widget</ProductName>
                 <Quantity>5</Quantity>
+                <OrderUnit>C62</OrderUnit>
                 <PriceAmount>9.99</PriceAmount>
+                <TaxRate>19</TaxRate>
             </OrderItem>
         </ORDER_ITEM_LIST>
     </ORDER>"""
@@ -147,6 +149,8 @@ def test_parse_opentrans_xml():
     check(it["Artikelnummer"] == "ART-1", f"Artikelnummer -> {it['Artikelnummer']!r}")
     check(it["Beschreibung"] == "Widget", f"Beschreibung -> {it['Beschreibung']!r}")
     check(it["Menge"] == "5", f"Menge -> {it['Menge']!r}")
+    check(it["Einheit"] == "C62", f"Einheit gefüllt -> {it['Einheit']!r}")
+    check(it["Steuer"] == "19", f"Steuer gefüllt -> {it['Steuer']!r}")
 
 
 def test_escape_excel_formula():
