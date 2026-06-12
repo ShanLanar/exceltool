@@ -19,4 +19,4 @@ dependencies = [
 dev = ["pytest"]
 
 [tool.setuptools]
-py-modules = ["exceltool"]
+py-modules = ["core", "exceltool"]

@@ -18,4 +18,4 @@ jobs:
       # Syntax-Smoke-Check ohne GUI/Abhaengigkeiten.
       # Echte Tests benoetigen GUI/Deps und laufen lokal via pytest.
       - name: Compile check
-        run: python -m py_compile exceltool.py
+        run: python -m py_compile core.py exceltool.py
