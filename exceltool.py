@@ -138,6 +138,18 @@ def safe_str(val) -> str:
         return "—"
 
 
+def escape_excel_formula(s: str) -> str:
+    """
+    Entschärft CSV-/Formel-Injection: Werte aus Fremdquellen (EDIFACT/XML),
+    die mit = + - @ oder einem Steuerzeichen beginnen, könnten von Excel als
+    Formel ausgewertet werden. Ein vorangestelltes Apostroph macht sie zu Text
+    (Excel blendet das Apostroph aus, der angezeigte Wert bleibt gleich).
+    """
+    if isinstance(s, str) and s[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + s
+    return s
+
+
 def format_excel(file_path: str) -> None:
     """Formatiert alle Sheets: Kopfzeile fett, Spaltenbreite automatisch (max 60)."""
     try:
@@ -178,13 +190,15 @@ def export_to_excel(header_dict: Dict[str, Any], items_list: List[Dict[str, Any]
         return
     try:
         with pd.ExcelWriter(save_path, engine="openpyxl") as writer:
-            header_rows = [{"Feld": k, "Wert": safe_str(v)} for k, v in header_dict.items()]
+            header_rows = [{"Feld": k, "Wert": escape_excel_formula(safe_str(v))}
+                           for k, v in header_dict.items()]
             pd.DataFrame(header_rows).to_excel(writer, sheet_name="Header", index=False)
             all_keys = [
                 "Position", "Artikelnummer", "Beschreibung", "Menge", "Einheit",
                 "Preis", "Nettowert", "Lieferdatum", "Incoterm", "Steuer", "Währung"
             ]
-            norm_items = [{k: safe_str(it.get(k)) for k in all_keys} for it in items_list]
+            norm_items = [{k: escape_excel_formula(safe_str(it.get(k))) for k in all_keys}
+                          for it in items_list]
             pd.DataFrame(norm_items).to_excel(writer, sheet_name="Positionen", index=False)
         format_excel(save_path)
         messagebox.showinfo("Erfolg", f"Export erfolgreich: {save_path}")
@@ -593,7 +607,10 @@ def parse_opentrans_xml(raw: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]],
         "Lieferadresse.E-Mail": delivery_email,
     })
 
+    pos_counter = 0
     for item in root_xml.findall(f".//{ns_tag('OrderItem')}"):
+        pos_counter += 1
+
         def find_in_item(paths: List[str]) -> str:
             for p in paths:
                 el = item.find(p)
@@ -603,6 +620,8 @@ def parse_opentrans_xml(raw: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]],
                         return t
             return "—"
 
+        line_no = find_in_item([f".//{ns_tag('LineItemID')}", f".//{ns_tag('LINE_ITEM_ID')}",
+                                f".//{ns_tag('LineNumber')}", f".//{ns_tag('LINE_NUMBER')}"])
         pid = find_in_item([f".//{ns_tag('ProductID')}", f".//{ns_tag('PRODUCT_ID')}"])
         name = find_in_item([f".//{ns_tag('ProductName')}", f".//{ns_tag('PRODUCT_NAME')}",
                              f".//{ns_tag('DESCRIPTION_SHORT')}"])
@@ -612,7 +631,7 @@ def parse_opentrans_xml(raw: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]],
         del_date = find_in_item([f".//{ns_tag('DeliveryDate')}", f".//{ns_tag('EDATU')}"])
         incoterm = find_in_item([f".//{ns_tag('Incoterm')}", f".//{ns_tag('LKOND')}"])
         items.append({
-            "Position": "—",
+            "Position": line_no if line_no != "—" else str(pos_counter),
             "Artikelnummer": pid,
             "Beschreibung": name,
             "Menge": qty,

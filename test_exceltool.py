@@ -143,9 +143,21 @@ def test_parse_opentrans_xml():
     check(header.get("Währung") == "EUR", f"Währung -> {header.get('Währung')!r}")
     check(len(items) == 1, f"genau eine Position -> {len(items)}")
     it = items[0]
+    check(it["Position"] == "1", f"Position laufend gefüllt (nicht '—') -> {it['Position']!r}")
     check(it["Artikelnummer"] == "ART-1", f"Artikelnummer -> {it['Artikelnummer']!r}")
     check(it["Beschreibung"] == "Widget", f"Beschreibung -> {it['Beschreibung']!r}")
     check(it["Menge"] == "5", f"Menge -> {it['Menge']!r}")
+
+
+def test_escape_excel_formula():
+    print("test_escape_excel_formula")
+    check(et.escape_excel_formula("=SUM(A1:A9)") == "'=SUM(A1:A9)", "Formel (=) entschärft")
+    check(et.escape_excel_formula("+1+1") == "'+1+1", "Formel (+) entschärft")
+    check(et.escape_excel_formula("@cmd") == "'@cmd", "Formel (@) entschärft")
+    check(et.escape_excel_formula("-1-1") == "'-1-1", "Formel (-) entschärft")
+    check(et.escape_excel_formula("ART-1") == "ART-1", "harmloser Wert unverändert")
+    check(et.escape_excel_formula("Widget") == "Widget", "Text unverändert")
+    check(et.escape_excel_formula("—") == "—", "Platzhalter unverändert")
 
 
 def test_parse_parameter_xml():
@@ -305,6 +317,7 @@ def main():
         test_parse_edifact,
         test_parse_orders05_xml,
         test_parse_opentrans_xml,
+        test_escape_excel_formula,
         test_parse_parameter_xml,
         test_split_csv_file,
         test_strip_protection_xml,
