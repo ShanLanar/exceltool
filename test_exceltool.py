@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Regressionstests für exceltool.py (reine Logik, ohne GUI).
 
@@ -9,15 +8,14 @@ tkinter wird nur gestubbt, wenn es nicht installiert ist (Headless-/CI-Umgebung)
 Der GUI-Aufbau liegt in main() und wird beim bloßen Import NICHT ausgeführt.
 """
 
-import os
-import sys
-import time
-import types
-import tempfile
-import zipfile
-
 # --- tkinter ggf. stubben, damit das Modul auch headless importierbar ist ---
 import importlib.util
+import os
+import sys
+import tempfile
+import time
+import types
+import zipfile
 
 if importlib.util.find_spec("tkinter") is None:  # pragma: no cover - umgebungsabhängig
     _stub = types.ModuleType("tkinter")
@@ -28,21 +26,18 @@ if importlib.util.find_spec("tkinter") is None:  # pragma: no cover - umgebungsa
     sys.modules["tkinter"] = _stub
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import exceltool as et  # noqa: E402
-
+import exceltool as et  # noqa: E402, I001  (Import bewusst nach dem tkinter-Stub)
 
 # ----------------------------------------------------------------------------
 # kleine Test-Infrastruktur (ohne externe Abhängigkeit)
 # ----------------------------------------------------------------------------
-_failures = []
-
-
 def check(cond, msg):
+    """Wie ein assert, mit Klartext-Ausgabe; pytest-tauglich (wirft bei Fehler)."""
     if cond:
         print(f"  ok   - {msg}")
     else:
         print(f"  FAIL - {msg}")
-        _failures.append(msg)
+        raise AssertionError(msg)
 
 
 # ----------------------------------------------------------------------------
@@ -330,12 +325,18 @@ def main():
         test_convert_empty_creates_placeholder,
         test_run_in_background_smoke,
     ]
+    failures = []
     for t in tests:
-        t()
+        try:
+            t()
+        except AssertionError as e:
+            failures.append(f"{t.__name__}: {e}")
+        except Exception as e:  # noqa: BLE001 - Sammel-Runner soll robust bleiben
+            failures.append(f"{t.__name__}: unerwartet {e!r}")
     print("\n" + ("=" * 50))
-    if _failures:
-        print(f"FEHLGESCHLAGEN: {len(_failures)} Prüfung(en)")
-        for m in _failures:
+    if failures:
+        print(f"FEHLGESCHLAGEN: {len(failures)} Test(s)")
+        for m in failures:
             print(f"  - {m}")
         sys.exit(1)
     print("ALLE TESTS BESTANDEN")

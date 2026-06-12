@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Daten-Tool (GUI) für:
   1) CSV/XLS/XLSX → Excel (Mehrfachauswahl, jede Datei/Sheet als eigener Reiter)
@@ -24,23 +23,24 @@ Verbesserungen (siehe Commit-History):
 
 from __future__ import annotations
 
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
-import pandas as pd
-import os
 import csv
+import logging
 import math
-import zipfile
+import os
+import queue
+import re
 import shutil
 import tempfile
 import threading
-import queue
-import logging
+import tkinter as tk
 import xml.etree.ElementTree as ET
+import zipfile
+from tkinter import filedialog, messagebox, ttk
+from typing import Any
+
+import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.styles import Font
-import re
-from typing import Dict, Any, List, Tuple, Optional
 
 logger = logging.getLogger("exceltool")
 
@@ -53,7 +53,7 @@ logger = logging.getLogger("exceltool")
 # gefahrlos prüfen können, ob das Fenster (noch) existiert.
 root = None
 
-_ui_queue: "queue.Queue" = queue.Queue()
+_ui_queue: queue.Queue = queue.Queue()
 _task_running = False
 _pump_after_id = None
 
@@ -171,17 +171,17 @@ def format_excel(file_path: str) -> None:
                 for cell in col:
                     v = cell.value
                     if v is not None:
-                        l = len(str(v))
-                        if l > max_len:
-                            max_len = l
+                        length = len(str(v))
+                        if length > max_len:
+                            max_len = length
                 ws.column_dimensions[col_letter].width = min(max_len + 2, 60)
         wb.save(file_path)
     except Exception as e:
         logger.warning("Formatierung nicht vollständig möglich: %s", e)
 
 
-def export_to_excel(header_dict: Dict[str, Any], items_list: List[Dict[str, Any]],
-                    doc_id: Optional[str] = None) -> None:
+def export_to_excel(header_dict: dict[str, Any], items_list: list[dict[str, Any]],
+                    doc_id: str | None = None) -> None:
     """Exportiert Header und Positionen in eine Excel-Datei."""
     default_name = f"{doc_id or 'export'}.xlsx"
     save_path = filedialog.asksaveasfilename(
@@ -214,13 +214,13 @@ def export_to_excel(header_dict: Dict[str, Any], items_list: List[Dict[str, Any]
 # CSV/XLS/XLSX → Excel (Konverter)
 # =========================================================
 
-selected_files_convert: List[str] = []
+selected_files_convert: list[str] = []
 
 
 def detect_delimiter(file_path: str) -> str:
     """Erkennt automatisch das Trennzeichen einer CSV."""
     try:
-        with open(file_path, 'r', encoding='utf-8-sig') as f:
+        with open(file_path, encoding='utf-8-sig') as f:
             sample = f.read(4096)
             dialect = csv.Sniffer().sniff(sample, delimiters=',;\t|')
             return dialect.delimiter
@@ -285,7 +285,7 @@ def select_files_convert(listbox: tk.Listbox, status_label: ttk.Label,
     status_label.config(text=f"{len(selected_files_convert)} Datei(en) ausgewählt.")
 
 
-def convert_files_to_workbook(files: List[str], save_path: str,
+def convert_files_to_workbook(files: list[str], save_path: str,
                               progress=None, on_file_error=None) -> int:
     """
     Reine Konvertierungslogik (ohne GUI, damit headless testbar):
@@ -381,7 +381,7 @@ def csv_xls_to_excel(progress_bar: ttk.Progressbar, status_label: ttk.Label) -> 
 # Blattschutz entfernen (Stapellauf)
 # =========================================================
 
-selected_files_protect: List[str] = []
+selected_files_protect: list[str] = []
 
 
 def select_files_protect(listbox: tk.Listbox, status_label: ttk.Label,
@@ -425,7 +425,7 @@ def _strip_protection_xml(xml_bytes: bytes) -> bytes:
     return text.encode("utf-8")
 
 
-def entferne_schutz_on_file(xlsx_or_xls_path: str) -> Tuple[bool, str]:
+def entferne_schutz_on_file(xlsx_or_xls_path: str) -> tuple[bool, str]:
     """
     Entfernt Sheet- und Workbook-Schutz, indem nur die betroffenen XML-Teile der
     OOXML-Datei textuell bereinigt werden; alle übrigen ZIP-Einträge bleiben
@@ -508,18 +508,18 @@ def remove_protection_batch(progress_bar: ttk.Progressbar, status_label: ttk.Lab
 # Parser: OpenTrans / ORDERS05 / EDIFACT
 # =========================================================
 
-last_parsed_header: Dict[str, Any] = {}
-last_parsed_items: List[Dict[str, Any]] = []
-last_doc_id: Optional[str] = None
+last_parsed_header: dict[str, Any] = {}
+last_parsed_items: list[dict[str, Any]] = []
+last_doc_id: str | None = None
 
 
 # -------------------------------
 # OpenTrans Parser (XML)
 # -------------------------------
 
-def parse_opentrans_xml(raw: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]], Optional[str]]:
-    items: List[Dict[str, Any]] = []
-    header: Dict[str, Any] = {}
+def parse_opentrans_xml(raw: str) -> tuple[dict[str, Any], list[dict[str, Any]], str | None]:
+    items: list[dict[str, Any]] = []
+    header: dict[str, Any] = {}
     try:
         root_xml = ET.fromstring(raw)
     except Exception as e:
@@ -531,7 +531,7 @@ def parse_opentrans_xml(raw: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]],
             return f"{{{ns}}}{tag}"
         return tag
 
-    def find_text_any(paths: List[str]) -> str:
+    def find_text_any(paths: list[str]) -> str:
         for p in paths:
             el = root_xml.find(p)
             if el is not None and el.text:
@@ -615,9 +615,9 @@ def parse_opentrans_xml(raw: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]],
     for item in root_xml.findall(f".//{ns_tag('OrderItem')}"):
         pos_counter += 1
 
-        def find_in_item(paths: List[str]) -> str:
+        def find_in_item(paths: list[str], node=item) -> str:
             for p in paths:
-                el = item.find(p)
+                el = node.find(p)
                 if el is not None and el.text:
                     t = el.text.strip()
                     if t:
@@ -659,9 +659,9 @@ def parse_opentrans_xml(raw: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]],
 # ORDERS05 Parser (XML)
 # -------------------------------
 
-def parse_orders05_xml(raw: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]], Optional[str]]:
-    items: List[Dict[str, Any]] = []
-    header: Dict[str, Any] = {}
+def parse_orders05_xml(raw: str) -> tuple[dict[str, Any], list[dict[str, Any]], str | None]:
+    items: list[dict[str, Any]] = []
+    header: dict[str, Any] = {}
     try:
         root_xml = ET.fromstring(raw)
     except Exception as e:
@@ -683,7 +683,7 @@ def parse_orders05_xml(raw: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]], 
     bsart = get_text(k01, "BSART", "—") if k01 is not None else "—"
     belnr = get_text(k01, "BELNR", "—") if k01 is not None else "—"
 
-    parties: Dict[str, Dict[str, str]] = {}
+    parties: dict[str, dict[str, str]] = {}
     for ka1 in root_xml.findall(".//E1EDKA1"):
         role = get_text(ka1, "PARVW", "")
         if not role:
@@ -773,7 +773,7 @@ def parse_orders05_xml(raw: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]], 
 # EDIFACT Parser (Text)
 # -------------------------------
 
-def parse_edifact(raw: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]], Optional[str]]:
+def parse_edifact(raw: str) -> tuple[dict[str, Any], list[dict[str, Any]], str | None]:
     """Parser für EDIFACT ORDERS D.96A (heuristisch)."""
     component_sep = ':'
     element_sep = '+'
@@ -793,7 +793,7 @@ def parse_edifact(raw: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]], Optio
 
     segments = [s for s in raw.split(segment_terminator) if s.strip()]
 
-    def split_elements(seg: str) -> List[str]:
+    def split_elements(seg: str) -> list[str]:
         elements = []
         current = ''
         i = 0
@@ -816,7 +816,7 @@ def parse_edifact(raw: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]], Optio
         parts = split_elements(seg)
         return parts[idx] if len(parts) > idx else ''
 
-    def split_components(elem: str) -> List[str]:
+    def split_components(elem: str) -> list[str]:
         comps = []
         current = ''
         i = 0
@@ -835,17 +835,17 @@ def parse_edifact(raw: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]], Optio
         comps.append(current)
         return comps
 
-    header: Dict[str, Any] = {
+    header: dict[str, Any] = {
         "Dokumenttyp": "EDIFACT ORDERS",
         "Dokument-ID": "—",
         "Datum": "—",
         "Währung": "—",
     }
 
-    parties: Dict[str, Dict[str, str]] = {}
-    party_contacts: Dict[str, Dict[str, str]] = {}
-    items: List[Dict[str, Any]] = []
-    current_item: Optional[Dict[str, Any]] = None
+    parties: dict[str, dict[str, str]] = {}
+    party_contacts: dict[str, dict[str, str]] = {}
+    items: list[dict[str, Any]] = []
+    current_item: dict[str, Any] | None = None
     position_counter = 0
 
     def ensure_party(role: str):
@@ -1062,7 +1062,7 @@ def copy_summary_to_clipboard(parser_output: tk.Text) -> None:
 # Tab 4: CSV-Splitter (split_csv_2000)
 # =========================================================
 
-selected_files_split: List[str] = []
+selected_files_split: list[str] = []
 
 
 def select_files_split(listbox: tk.Listbox, status_label: ttk.Label,
@@ -1087,11 +1087,11 @@ def split_csv_file(file_path: str, chunk_size: int, log_fn) -> int:
     Gibt Anzahl erzeugter Dateien zurück.
     Encoding-Fallback: utf-8 → iso-8859-1 → cp1252.
     """
-    header: List[str] = []
-    rows: List[List[str]] = []
+    header: list[str] = []
+    rows: list[list[str]] = []
     for enc in ["utf-8-sig", "utf-8", "iso-8859-1", "cp1252"]:
         try:
-            with open(file_path, "r", encoding=enc, newline="") as f:
+            with open(file_path, encoding=enc, newline="") as f:
                 reader = csv.reader(f)
                 header = next(reader, [])
                 rows   = list(reader)
@@ -1167,7 +1167,7 @@ def run_split(chunk_size_var: tk.IntVar, progress_bar: ttk.Progressbar,
 # Tab 5: XML → CSV (etc_partner_wandeln)
 # =========================================================
 
-def parse_parameter_xml(xml_text: str) -> Tuple[List[str], List[str]]:
+def parse_parameter_xml(xml_text: str) -> tuple[list[str], list[str]]:
     """
     Liest ein XML-Fragment mit <PARAMETER DISPLAYNAME="...">Wert</PARAMETER>
     und gibt (header, values) zurück.
@@ -1183,7 +1183,7 @@ def parse_parameter_xml(xml_text: str) -> Tuple[List[str], List[str]]:
         try:
             root_el = ET.fromstring(f"<ROOT>{text}</ROOT>")
         except ET.ParseError as e:
-            raise ValueError(f"XML konnte nicht geparst werden: {e}")
+            raise ValueError(f"XML konnte nicht geparst werden: {e}") from e
 
     params = root_el.findall(".//PARAMETER")
     if not params:
@@ -1267,7 +1267,7 @@ def preview_xml(xml_input: tk.Text, preview_widget: tk.Text) -> None:
     preview_widget.delete("1.0", tk.END)
     preview_widget.insert("end", f"{len(header)} Felder erkannt:\n\n")
     col_w = 28
-    for h, v in zip(header, values):
+    for h, v in zip(header, values, strict=False):
         line = f"  {h[:col_w]:<{col_w}}  {v[:60]}\n"
         preview_widget.insert("end", line)
     preview_widget.config(state="disabled")

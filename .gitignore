@@ -2,5 +2,9 @@ __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
 *_entschuetzt.xlsx
 *_part[0-9]*.csv
